@@ -401,11 +401,21 @@ func (child *partitionConsumer) HighWaterMarkOffset() int64 {
 }
 
 func (child *partitionConsumer) responseFeeder() {
+feederLoop:
 	for response := range child.feeder {
 		switch msgs, err := child.parseResponse(response); err {
 		case nil:
-			for _, msg := range msgs {
-				child.messages <- msg
+			for i, msg := range msgs {
+				select {
+				case child.messages <- msg:
+				case <-time.After(child.conf.Consumer.MaxProcessingTime):
+					child.broker.done <- child
+					for _, msg = range msgs[i:] {
+						child.messages <- msg
+					}
+					child.broker.input <- child
+					continue feederLoop
+				}
 			}
 		case ErrOffsetOutOfRange:
 			// there's no point in retrying this it will just fail the same way again
@@ -422,7 +432,7 @@ func (child *partitionConsumer) responseFeeder() {
 			child.dispatchReason = err
 		}
 
-		child.broker.acks.Done()
+		child.broker.done <- nil
 	}
 
 	close(child.messages)
@@ -504,7 +514,7 @@ type brokerConsumer struct {
 	newSubscriptions chan []*partitionConsumer
 	wait             chan none
 	subscriptions    map[*partitionConsumer]none
-	acks             sync.WaitGroup
+	done             chan *partitionConsumer
 	refs             int
 }
 
@@ -516,6 +526,7 @@ func (c *consumer) newBrokerConsumer(broker *Broker) *brokerConsumer {
 		newSubscriptions: make(chan []*partitionConsumer),
 		wait:             make(chan none),
 		subscriptions:    make(map[*partitionConsumer]none),
+		done:             make(chan *partitionConsumer),
 		refs:             0,
 	}
 
@@ -587,11 +598,17 @@ func (bc *brokerConsumer) subscriptionConsumer() {
 			return
 		}
 
-		bc.acks.Add(len(bc.subscriptions))
+		expected := len(bc.subscriptions)
 		for child := range bc.subscriptions {
 			child.feeder <- response
 		}
-		bc.acks.Wait()
+		for i := 0; i < expected; i++ {
+			if child := <-bc.done; child != nil {
+				Logger.Printf("consumer/broker/%d abandoned subscription to %s/%d because consuming was taking too long\n",
+					bc.broker.ID(), child.topic, child.partition)
+				delete(bc.subscriptions, child)
+			}
+		}
 	}
 }
 
